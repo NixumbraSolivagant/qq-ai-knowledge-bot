@@ -155,7 +155,7 @@ NapCat 应按其官方文档单独配置为开机启动。不要把 NapCat 的�
 - `CHAT_COOLDOWN_SECONDS`：每位用户问答冷却时间
 - `SOURCE_CACHE_SECONDS`：近期资料缓存时间，默认 6 小时
 - `SOURCE_TIMEOUT_SECONDS`：单轮资料抓取的超时上限，默认 6 秒
-- `SOURCE_ITEMS_PER_REQUEST`：每次交给模型筛选的资料条数，默认 3 条
+- `SOURCE_ITEMS_PER_REQUEST`：每次交给模型凝练的文章数量，默认 1 篇，避免混合多篇文章
 
 资料抓取是软依赖：某个网站不可访问时会自动跳过，所有来源都不可用时仍会使用本地专题知识，不会让机器人崩溃。
 
