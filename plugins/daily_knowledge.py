@@ -193,12 +193,75 @@ def _truncate_at_sentence(text: str, max_chars: int) -> str:
 
 def _compact_knowledge(text: str, detailed: bool) -> str:
     if detailed:
-        return _truncate_at_sentence(text, 850)
+        return _truncate_at_sentence(text, 1400)
     source_match = re.search(r"(?:\n|^)资料来源：\s*(https?://\S+)", text)
     source = source_match.group(1) if source_match else ""
     body = text[: source_match.start()].rstrip() if source_match else text
-    body = _truncate_at_sentence(body, 280)
+    body = _truncate_at_sentence(body, 650)
     return f"{body}\n\n资料来源：{source}" if source else body
+
+
+def _source_url(source_material: str) -> str:
+    source_match = re.search(r"(?:\n|^)来源：(https?://\S+)", source_material)
+    if source_match is None:
+        raise ValueError("资料输入缺少来源网址")
+    return source_match.group(1)
+
+
+def _evidence_candidates(source_material: str) -> list[str]:
+    body_match = re.search(r"摘要：(.*)\n来源：https?://\S+", source_material, re.DOTALL)
+    body = body_match.group(1) if body_match else source_material
+    sentences = re.split(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+(?=[A-Z0-9])", body)
+    candidates = []
+    for sentence in sentences:
+        sentence = re.sub(r"\s+", " ", sentence).strip(" -•\t")
+        if 18 <= len(sentence) <= 90 and sentence not in candidates:
+            candidates.append(sentence)
+        elif len(sentence) > 90:
+            clauses = re.split(r"(?<=[，,:：])\s*", sentence)
+            candidates.extend(
+                clause for clause in clauses if 18 <= len(clause) <= 90 and clause not in candidates
+            )
+    if len(candidates) < 2:
+        chunks = [body[index : index + 80].strip() for index in range(0, min(len(body), 800), 80)]
+        candidates.extend(chunk for chunk in chunks if len(chunk) >= 18 and chunk not in candidates)
+    return candidates[:10]
+
+
+def _validate_grounded_knowledge(text: str, source_material: str, evidence_candidates: list[str]) -> tuple[int, int]:
+    if re.search(r"https?://", text):
+        raise ValueError("模型输出不应自行填写网址")
+    evidence_match = re.search(r"依据编号：\s*(\d+)\s*[,，]\s*(\d+)", text)
+    if evidence_match is None:
+        raise ValueError("输出缺少依据编号")
+    evidence_indexes = tuple(int(value) - 1 for value in evidence_match.groups())
+    if evidence_indexes[0] == evidence_indexes[1] or any(
+        index < 0 or index >= len(evidence_candidates) for index in evidence_indexes
+    ):
+        raise ValueError("依据编号无效")
+
+    source_numbers = set(re.findall(r"\d+(?:\.\d+)?%?", source_material))
+    summary_without_evidence_ids = re.sub(r"依据编号：[^\n]+", "", text)
+    unsupported_numbers = {
+        number
+        for number in re.findall(r"\d+(?:\.\d+)?%?", summary_without_evidence_ids)
+        if number not in source_numbers
+    }
+    if unsupported_numbers:
+        raise ValueError(f"输出包含原文未出现的数字：{', '.join(sorted(unsupported_numbers))}")
+    return evidence_indexes
+
+
+def _render_grounded_knowledge(text: str, source_material: str, evidence_candidates: list[str], detailed: bool) -> str:
+    first_index, second_index = _validate_grounded_knowledge(text, source_material, evidence_candidates)
+    body = re.sub(r"\n?依据编号：[^\n]+", "", text).strip()
+    body = _truncate_at_sentence(body, 1000 if detailed else 520)
+    return (
+        f"{body}\n\n"
+        f"依据摘录一：{evidence_candidates[first_index]}\n"
+        f"依据摘录二：{evidence_candidates[second_index]}\n"
+        f"资料来源：{_source_url(source_material)}"
+    )
 
 
 def _wants_detailed(question: str) -> bool:
@@ -250,6 +313,23 @@ def _clean_feed_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _extract_article_text(page: str) -> str:
+    page = re.sub(
+        r"<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>|<noscript\b[^>]*>.*?</noscript>",
+        " ",
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    article_match = re.search(
+        r"<(?:article|main)\b[^>]*>(.*?)</(?:article|main)>",
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    content = article_match.group(1) if article_match else page
+    content = re.sub(r"</?(?:p|h[1-6]|li|blockquote|br)\b[^>]*>", "\n", content, flags=re.IGNORECASE)
+    return re.sub(r"\n{2,}", "\n", _clean_feed_text(content)).strip()[:6000]
+
+
 def _first_node(entry: ET.Element, names: tuple[str, ...]) -> ET.Element | None:
     for name in names:
         node = entry.find(name)
@@ -258,19 +338,13 @@ def _first_node(entry: ET.Element, names: tuple[str, ...]) -> ET.Element | None:
     return None
 
 
-async def _fetch_page_summary(client: httpx.AsyncClient, url: str) -> str:
-    response = await client.get(url)
-    response.raise_for_status()
-    page = response.text
-    patterns = (
-        r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\'](?:description|og:description)["\']',
-    )
-    for pattern in patterns:
-        match = re.search(pattern, page, re.IGNORECASE)
-        if match:
-            return _clean_feed_text(match.group(1))[:900]
-    return ""
+async def _fetch_page_content(client: httpx.AsyncClient, url: str) -> str:
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+        return _extract_article_text(response.text)
+    except Exception:
+        return ""
 
 
 async def _fetch_feed_materials(client: httpx.AsyncClient, source_name: str, feed_url: str) -> list[str]:
@@ -279,17 +353,24 @@ async def _fetch_feed_materials(client: httpx.AsyncClient, source_name: str, fee
         response.raise_for_status()
         root = ET.fromstring(response.content)
         entries = root.findall(".//item") or root.findall(".//{*}entry")
-        materials = []
-        for entry in entries[:5]:
+        feed_entries = []
+        for entry in entries[:3]:
             title_node = _first_node(entry, ("title", "{*}title"))
             summary_node = _first_node(entry, ("description", "summary", "{*}summary", "{*}content"))
             link_node = _first_node(entry, ("link", "{*}link", "guid"))
             title = _clean_feed_text(title_node.text or "") if title_node is not None else ""
-            summary = _clean_feed_text(summary_node.text or "")[:900] if summary_node is not None else ""
+            summary_text = "".join(summary_node.itertext()) if summary_node is not None else ""
+            summary = _clean_feed_text(summary_text)[:1200]
             link = (link_node.get("href") or link_node.text or "").strip() if link_node is not None else ""
-            if title and link and not summary and any(domain in link for domain in REFERENCE_DOMAINS):
-                summary = await _fetch_page_summary(client, link)
-            if title and summary and any(domain in link for domain in REFERENCE_DOMAINS):
+            if title and link and any(domain in link for domain in REFERENCE_DOMAINS):
+                feed_entries.append((title, summary, link))
+
+        pages = await asyncio.gather(*(_fetch_page_content(client, link) for _, _, link in feed_entries))
+        materials = []
+        for (title, summary, link), article in zip(feed_entries, pages):
+            if article:
+                summary = f"{summary}\n原文正文：{article}" if summary else article
+            if summary:
                 materials.append(f"来源机构：{source_name}\n标题：{title}\n摘要：{summary}\n来源：{link}")
         return materials
     except Exception as exc:
@@ -304,7 +385,6 @@ async def _fetch_source_material() -> str:
         return source_cache[1]
 
     timeout_seconds = float(os.getenv("SOURCE_TIMEOUT_SECONDS", "6"))
-    max_items = max(1, min(int(os.getenv("SOURCE_ITEMS_PER_REQUEST", "3")), 5))
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 4.0))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
@@ -315,59 +395,71 @@ async def _fetch_source_material() -> str:
     materials = [material for source_materials in results for material in source_materials]
     if not materials:
         raise RuntimeError("所有专业资料源暂时不可用")
-    selected = random.sample(materials, min(max_items, len(materials)))
-    material = "\n\n---\n\n".join(selected)
+    substantial_materials = [material for material in materials if len(material) >= 1200]
+    if not substantial_materials:
+        raise RuntimeError("已连接资料源，但未取得足够完整的文章正文")
+    material = random.choice(substantial_materials)
     source_cache = (time.monotonic(), material)
-    logger.info("资料抓取耗时：{:.2f}s，可用条目：{}，选用：{}", time.perf_counter() - started_at, len(materials), len(selected))
+    logger.info(
+        "资料抓取耗时：{:.2f}s，可用条目：{}，完整文章：{}",
+        time.perf_counter() - started_at,
+        len(materials),
+        len(substantial_materials),
+    )
     return material
 
 
 async def _build_advanced_knowledge(detailed: bool = False) -> Message:
-    topic = random.choice(ADVANCED_TOPICS)
     try:
         source_material = await _fetch_source_material()
+        evidence_candidates = _evidence_candidates(source_material)
+        if len(evidence_candidates) < 2:
+            raise ValueError("原文没有足够的可核验证据片段")
     except Exception as exc:
-        logger.warning("近期 AI 资料暂不可用，改用稳定专题知识：{}", exc)
-        source_material = ""
-    if source_material:
-        source_instruction = (
-            "下方提供了多条真实抓取的近期论文、官方博客或官方项目资料。选择其中最有技术价值的一条作为知识输入；"
-            "最后必须标注“资料来源：”，并且只能原样复制材料中的一个来源网址。"
-        )
-        source_input = source_material
-    else:
-        source_instruction = (
-            "当前没有可用的外部资料。请仅基于稳定的专业知识讨论备选专题，不得声称这是最新进展，"
-            "不得虚构论文、实验数据、版本号、引用或网址，也不要输出“资料来源”。"
-        )
-        source_input = "无外部资料"
-    length_instruction = (
-        "正文 450 至 700 个中文字符，可以分成 3 至 5 个短段落。"
-        if detailed
-        else "正文 160 至 240 个中文字符，只保留最关键的机制、误区和工程启示，适合群聊快速阅读。"
+        logger.warning("无法取得足够完整的专业原文，本次不生成：{}", exc)
+        return Message("⚠️ 本次没有拿到足够完整且可核验的专业原文，暂不发送，稍后再试。")
+
+    evidence_list = "\n".join(
+        f"{index}. {candidate}" for index, candidate in enumerate(evidence_candidates, start=1)
     )
-    prompt = (
-        f"今天是 {datetime.now():%Y-%m-%d}。请写一条面向有一定编程基础读者的 AI 深度知识。备选专题是：{topic}。"
-        f"{source_instruction}如果资料与备选专题不一致，以资料为准。难度定位为研究生入门或工程实践，不要解释最基础定义。"
-        f"{length_instruction}"
-        "必须包含：1）核心机制；2）一个关键公式、复杂度关系或训练/推理权衡（无法写公式时给出精确因果关系）；"
-        "3）一个常见误区或失败条件；4）一个实际工程启示。结构清晰但不要 Markdown 表格。"
-        "QQ 不支持 LaTeX 或 Markdown 数学公式。所有公式必须写成单行纯文本，例如："
-        "Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))*V，复杂度写成 O(n^2*d)。"
-        "禁止使用美元符号、反斜杠命令、frac、数学代码块或 Markdown 标题。"
-        "不要编造论文、数据、版本号或实验结论。"
-        "可以讨论 AI 产品、产业、开源、算力、机器人、教育、医疗应用、就业、版权、隐私保护、安全与伦理。"
-        "涉及争议时保持中立并聚焦技术机制、可靠来源和实际影响；不得提供违法危险操作、隐私窃取、"
-        "医疗诊断或具体金融投资建议。"
-        f"直接以“标题：”开始，不要寒暄，不要反问读者。\n\n资料输入：\n{source_input}"
+    length_instruction = (
+        "正文 600 至 900 个中文字符，可以分成 4 至 6 个短段落。"
+        if detailed
+        else "正文 320 至 520 个中文字符，完成整篇文章的高密度压缩，适合群聊学习，不要写成泛泛科普。"
+    )
+    format_instruction = (
+        "固定结构为：标题、文章结论、关键机制、重要细节、适用边界、依据编号。"
+        "最后一行必须是“依据编号：N,M”，N 和 M 是下方证据候选中的两个不同编号。"
+        "不要输出网址、原文摘录、Markdown 表格或 Markdown 标题。"
+    )
+    grounding_instruction = (
+        "只压缩这一篇原文。每一个事实、数字、比较、因果关系和结论都必须由原文直接支持。"
+        "原文没有的公式、数字、实验结果、模型版本、背景知识、评价和工程建议一律不要补写。"
+        "只有原文明确给出时才可写公式、复杂度、数字或实验结果。"
+        "如果原文没有明确限制，在适用边界写“原文未明确说明”，不要自行推测。"
+        "不要把常识、你的推断或其他文章的信息混入摘要。"
+    )
+    source_input = f"{source_material}\n\n可核验的原文证据候选：\n{evidence_list}"
+    draft_prompt = (
+        "你是一名严谨的 AI 技术编辑。请把下面这一篇文章凝练成让群友真正学到东西的中文摘要。"
+        f"{length_instruction}{format_instruction}{grounding_instruction}"
+        f"\n\n原文资料：\n{source_input}"
     )
     try:
-        text = await _call_ark(prompt, allow_links=bool(source_material), max_output_tokens=1000 if detailed else 500)
-        title = "📖 AI 深度阅读" if detailed else "📚 今日 AI 知识"
-        return Message(f"{title}\n\n{_compact_knowledge(text, detailed)}")
-    except Exception:
-        logger.exception("生成深度知识失败，使用高阶备用内容")
-        return Message(random.choice(FALLBACK_KNOWLEDGE))
+        draft = await _call_ark(draft_prompt, allow_links=False, max_output_tokens=1300 if detailed else 700)
+        review_prompt = (
+            "你是一名事实审校员。请逐句对照原文审查草稿，删除或改写所有原文未直接支持的内容。"
+            "不要保留仅仅合理但原文没有说的机制、数字、因果关系、评价或建议。"
+            f"{length_instruction}{format_instruction}{grounding_instruction}"
+            f"\n\n原文资料：\n{source_input}\n\n待审校草稿：\n{draft}"
+        )
+        reviewed = await _call_ark(review_prompt, allow_links=False, max_output_tokens=1300 if detailed else 700)
+        content = _render_grounded_knowledge(reviewed, source_material, evidence_candidates, detailed)
+        title = "📖 AI 文章精读" if detailed else "📚 今日 AI 文章凝练"
+        return Message(f"{title}\n\n{content}")
+    except Exception as exc:
+        logger.warning("文章凝练未通过原文校验，本次不发送未经证实内容：{}", exc)
+        return Message("⚠️ 本次文章凝练未通过事实校验，已停止发送未经证实的内容，请稍后重试。")
 
 
 def _history_text(group_id: int, user_id: int) -> str:
