@@ -1,0 +1,19 @@
+[Unit]
+Description=QQ AI Knowledge Bot (NoneBot)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/qq-ai-knowledge-bot
+EnvironmentFile=%h/qq-ai-knowledge-bot/.env
+Environment=NO_PROXY=127.0.0.1,localhost,::1
+Environment=no_proxy=127.0.0.1,localhost,::1
+ExecStart=%h/qq-ai-knowledge-bot/.venv/bin/python %h/qq-ai-knowledge-bot/bot.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
