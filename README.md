@@ -14,7 +14,7 @@
 - `追问 它的主要瓶颈是什么？`：结合最近对话追问
 - `@机器人 问题`：直接对话
 - `出题`、`答 A`、`解析`：进阶单选题互动
-- 从 arXiv 和 Hugging Face 官方 Feed 获取近期资料作为知识输入
+- 并发读取国内外专业来源：OpenAI、Google AI、Microsoft Research、NVIDIA、arXiv，以及 Qwen、PaddlePaddle、GLM、MiniCPM、InternLM、ModelScope、RAGFlow 等官方项目 Release
 - QQ 不支持的 LaTeX 会自动转换成纯文本
 - API 失败时使用本地高阶备用内容
 - 敏感内容、隐私窃取和危险操作请求会被拦截
@@ -154,6 +154,10 @@ NapCat 应按其官方文档单独配置为开机启动。不要把 NapCat 的�
 - `ARK_MODEL`：方舟模型名称
 - `CHAT_COOLDOWN_SECONDS`：每位用户问答冷却时间
 - `SOURCE_CACHE_SECONDS`：近期资料缓存时间，默认 6 小时
+- `SOURCE_TIMEOUT_SECONDS`：单轮资料抓取的超时上限，默认 6 秒
+- `SOURCE_ITEMS_PER_REQUEST`：每次交给模型筛选的资料条数，默认 3 条
+
+资料抓取是软依赖：某个网站不可访问时会自动跳过，所有来源都不可用时仍会使用本地专题知识，不会让机器人崩溃。
 
 普通内容是短版；想看长内容可以使用 `深度知识`、`详问`、`详细展开` 等表达。
 
