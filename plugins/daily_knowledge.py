@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import html
 import os
@@ -28,18 +29,34 @@ REFERENCE_LINKS = (
     "https://rss.arxiv.org/",
 )
 REFERENCE_DOMAINS = (
+    "openai.com",
+    "blog.google",
+    "microsoft.com",
+    "developer.nvidia.com",
     "pytorch.org",
     "huggingface.co",
     "deepmind.google",
     "deeplearning.ai",
     "arxiv.org",
     "rss.arxiv.org",
+    "github.com",
 )
 SOURCE_FEEDS = (
-    "https://rss.arxiv.org/rss/cs.LG",
-    "https://rss.arxiv.org/rss/cs.CL",
-    "https://rss.arxiv.org/rss/cs.AI",
-    "https://huggingface.co/blog/feed.xml",
+    ("OpenAI", "https://openai.com/news/rss.xml"),
+    ("Google AI", "https://blog.google/technology/ai/rss/"),
+    ("Microsoft Research", "https://www.microsoft.com/en-us/research/feed/"),
+    ("NVIDIA Technical Blog", "https://developer.nvidia.com/blog/category/artificial-intelligence/feed/"),
+    ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
+    ("arXiv cs.AI", "https://rss.arxiv.org/rss/cs.AI"),
+    ("arXiv cs.LG", "https://rss.arxiv.org/rss/cs.LG"),
+    ("arXiv cs.CL", "https://rss.arxiv.org/rss/cs.CL"),
+    ("通义千问 Qwen", "https://github.com/QwenLM/Qwen3/releases.atom"),
+    ("百度飞桨 PaddlePaddle", "https://github.com/PaddlePaddle/Paddle/releases.atom"),
+    ("智谱 GLM", "https://github.com/THUDM/GLM-4/releases.atom"),
+    ("面壁智能 MiniCPM", "https://github.com/OpenBMB/MiniCPM/releases.atom"),
+    ("RAGFlow", "https://github.com/infiniflow/ragflow/releases.atom"),
+    ("InternLM", "https://github.com/InternLM/InternLM/releases.atom"),
+    ("ModelScope", "https://github.com/modelscope/modelscope/releases.atom"),
 )
 BLOCKED_TERMS = (
     "制作爆炸物",
@@ -256,47 +273,74 @@ async def _fetch_page_summary(client: httpx.AsyncClient, url: str) -> str:
     return ""
 
 
+async def _fetch_feed_materials(client: httpx.AsyncClient, source_name: str, feed_url: str) -> list[str]:
+    try:
+        response = await client.get(feed_url)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        entries = root.findall(".//item") or root.findall(".//{*}entry")
+        materials = []
+        for entry in entries[:5]:
+            title_node = _first_node(entry, ("title", "{*}title"))
+            summary_node = _first_node(entry, ("description", "summary", "{*}summary", "{*}content"))
+            link_node = _first_node(entry, ("link", "{*}link", "guid"))
+            title = _clean_feed_text(title_node.text or "") if title_node is not None else ""
+            summary = _clean_feed_text(summary_node.text or "")[:900] if summary_node is not None else ""
+            link = (link_node.get("href") or link_node.text or "").strip() if link_node is not None else ""
+            if title and link and not summary and any(domain in link for domain in REFERENCE_DOMAINS):
+                summary = await _fetch_page_summary(client, link)
+            if title and summary and any(domain in link for domain in REFERENCE_DOMAINS):
+                materials.append(f"来源机构：{source_name}\n标题：{title}\n摘要：{summary}\n来源：{link}")
+        return materials
+    except Exception as exc:
+        logger.debug("资料源不可用：{}（{}）", source_name, type(exc).__name__)
+        return []
+
+
 async def _fetch_source_material() -> str:
     global source_cache
     cache_seconds = int(os.getenv("SOURCE_CACHE_SECONDS", "21600"))
     if source_cache and time.monotonic() - source_cache[0] < cache_seconds:
         return source_cache[1]
 
-    timeout = float(os.getenv("ARK_TIMEOUT_SECONDS", "30"))
+    timeout_seconds = float(os.getenv("SOURCE_TIMEOUT_SECONDS", "6"))
+    max_items = max(1, min(int(os.getenv("SOURCE_ITEMS_PER_REQUEST", "3")), 5))
     started_at = time.perf_counter()
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for feed_url in random.sample(SOURCE_FEEDS, len(SOURCE_FEEDS)):
-            try:
-                response = await client.get(feed_url)
-                response.raise_for_status()
-                root = ET.fromstring(response.content)
-                entries = root.findall(".//item") or root.findall(".//{*}entry")
-                for entry in entries[:5]:
-                    title_node = _first_node(entry, ("title", "{*}title"))
-                    summary_node = _first_node(entry, ("description", "summary", "{*}summary", "{*}content"))
-                    link_node = _first_node(entry, ("link", "{*}link", "guid"))
-                    title = _clean_feed_text(title_node.text or "") if title_node is not None else ""
-                    summary = _clean_feed_text(summary_node.text or "")[:900] if summary_node is not None else ""
-                    link = (link_node.get("href") or link_node.text or "").strip() if link_node is not None else ""
-                    if title and link and not summary and any(domain in link for domain in REFERENCE_DOMAINS):
-                        summary = await _fetch_page_summary(client, link)
-                    if title and summary and any(domain in link for domain in REFERENCE_DOMAINS):
-                        material = f"标题：{title}\n摘要：{summary}\n来源：{link}"
-                        source_cache = (time.monotonic(), material)
-                        logger.info("资料抓取耗时：{:.2f}s，来源：{}", time.perf_counter() - started_at, feed_url)
-                        return material
-            except Exception:
-                logger.warning("资料源不可用：{}", feed_url)
-    raise ValueError("所有 AI 资料源都不可用")
+    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 4.0))
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *(_fetch_feed_materials(client, source_name, feed_url) for source_name, feed_url in SOURCE_FEEDS)
+        )
+
+    materials = [material for source_materials in results for material in source_materials]
+    if not materials:
+        raise RuntimeError("所有专业资料源暂时不可用")
+    selected = random.sample(materials, min(max_items, len(materials)))
+    material = "\n\n---\n\n".join(selected)
+    source_cache = (time.monotonic(), material)
+    logger.info("资料抓取耗时：{:.2f}s，可用条目：{}，选用：{}", time.perf_counter() - started_at, len(materials), len(selected))
+    return material
 
 
 async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     topic = random.choice(ADVANCED_TOPICS)
     try:
         source_material = await _fetch_source_material()
-    except Exception:
-        logger.exception("获取近期 AI 资料失败，改用专题生成")
-        source_material = "本次外部资料源不可用，请基于稳定的专业知识讨论该专题，不要虚构最新进展或引用。"
+    except Exception as exc:
+        logger.warning("近期 AI 资料暂不可用，改用稳定专题知识：{}", exc)
+        source_material = ""
+    if source_material:
+        source_instruction = (
+            "下方提供了多条真实抓取的近期论文、官方博客或官方项目资料。选择其中最有技术价值的一条作为知识输入；"
+            "最后必须标注“资料来源：”，并且只能原样复制材料中的一个来源网址。"
+        )
+        source_input = source_material
+    else:
+        source_instruction = (
+            "当前没有可用的外部资料。请仅基于稳定的专业知识讨论备选专题，不得声称这是最新进展，"
+            "不得虚构论文、实验数据、版本号、引用或网址，也不要输出“资料来源”。"
+        )
+        source_input = "无外部资料"
     length_instruction = (
         "正文 450 至 700 个中文字符，可以分成 3 至 5 个短段落。"
         if detailed
@@ -304,22 +348,21 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     )
     prompt = (
         f"今天是 {datetime.now():%Y-%m-%d}。请写一条面向有一定编程基础读者的 AI 深度知识。备选专题是：{topic}。"
-        "下方提供了真实抓取的近期论文或官方博客资料。优先选择其中最有技术价值的一条作为知识输入；"
-        "如果资料与备选专题不一致，以资料为准。难度定位为研究生入门或工程实践，不要解释最基础定义。"
+        f"{source_instruction}如果资料与备选专题不一致，以资料为准。难度定位为研究生入门或工程实践，不要解释最基础定义。"
         f"{length_instruction}"
         "必须包含：1）核心机制；2）一个关键公式、复杂度关系或训练/推理权衡（无法写公式时给出精确因果关系）；"
         "3）一个常见误区或失败条件；4）一个实际工程启示。结构清晰但不要 Markdown 表格。"
         "QQ 不支持 LaTeX 或 Markdown 数学公式。所有公式必须写成单行纯文本，例如："
         "Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))*V，复杂度写成 O(n^2*d)。"
         "禁止使用美元符号、反斜杠命令、frac、数学代码块或 Markdown 标题。"
-        "不要编造论文、数据、版本号或实验结论。最后必须标注“资料来源：”，并且只能原样复制下方材料中的一个来源网址。"
+        "不要编造论文、数据、版本号或实验结论。"
         "可以讨论 AI 产品、产业、开源、算力、机器人、教育、医疗应用、就业、版权、隐私保护、安全与伦理。"
         "涉及争议时保持中立并聚焦技术机制、可靠来源和实际影响；不得提供违法危险操作、隐私窃取、"
         "医疗诊断或具体金融投资建议。"
-        f"直接以“标题：”开始，不要寒暄，不要反问读者。\n\n真实资料输入：\n{source_material}"
+        f"直接以“标题：”开始，不要寒暄，不要反问读者。\n\n资料输入：\n{source_input}"
     )
     try:
-        text = await _call_ark(prompt, allow_links=True, max_output_tokens=1000 if detailed else 500)
+        text = await _call_ark(prompt, allow_links=bool(source_material), max_output_tokens=1000 if detailed else 500)
         title = "📖 AI 深度阅读" if detailed else "📚 今日 AI 知识"
         return Message(f"{title}\n\n{_compact_knowledge(text, detailed)}")
     except Exception:
