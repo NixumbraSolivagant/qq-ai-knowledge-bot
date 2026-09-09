@@ -14,7 +14,7 @@
 - `追问 它的主要瓶颈是什么？`：结合最近对话追问
 - `@机器人 问题`：直接对话
 - `出题`、`答 A`、`解析`：进阶单选题互动
-- 并发读取国内外专业来源：OpenAI、Google AI、Microsoft Research、NVIDIA、arXiv，以及 Qwen、PaddlePaddle、GLM、MiniCPM、InternLM、ModelScope、RAGFlow 等官方项目 Release
+- 每日知识从教材 PDF、课程讲义、官方学习网站和专业技术博客中选择一篇完整资料，覆盖 Dive into Deep Learning、Stanford CS229、MIT Python、Python 官方教程、scikit-learn、PyTorch，以及国内 Qwen、PaddlePaddle、GLM、MiniCPM、InternLM、ModelScope、RAGFlow 等官方项目
 - QQ 不支持的 LaTeX 会自动转换成纯文本
 - API 失败时使用本地高阶备用内容
 - 敏感内容、隐私窃取和危险操作请求会被拦截
@@ -156,7 +156,7 @@ NapCat 应按其官方文档单独配置为开机启动。不要把 NapCat 的�
 - `SOURCE_CACHE_SECONDS`：近期资料缓存时间，默认 6 小时
 - `SOURCE_TIMEOUT_SECONDS`：单轮资料抓取的超时上限，默认 6 秒
 
-资料抓取是软依赖：某个网站不可访问时会自动跳过；所有来源都不可用、正文不完整或摘要未通过校验时，本次不会发送未经证实的知识内容。
+资料抓取是软依赖：某个网站不可访问时会自动跳过；所有来源都不可用、正文不完整或摘要未通过校验时，本次不会发送未经证实的知识内容。每日选题会在 Python、数据结构、机器学习、线性代数、深度学习和大语言模型等本科生方向间切换。
 
 `今日知识` 会选择一篇正文足够完整的专业文章，先生成凝练稿，再进行一次逐句原文对照审校。程序还会校验数字、证据编号和来源网址，并自动附上两条原文摘录；未通过校验时不会发送未经证实的摘要。
 
