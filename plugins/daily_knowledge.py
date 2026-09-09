@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import json
 import html
 import os
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
+from pypdf import PdfReader
 from nonebot import get_bots, get_driver, on_message, on_regex
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
 from nonebot.log import logger
@@ -40,6 +42,14 @@ REFERENCE_DOMAINS = (
     "arxiv.org",
     "rss.arxiv.org",
     "github.com",
+    "docs.python.org",
+    "python.org",
+    "ocw.mit.edu",
+    "stanford.edu",
+    "berkeley.edu",
+    "cmu.edu",
+    "d2l.ai",
+    "realpython.com",
 )
 SOURCE_FEEDS = (
     ("OpenAI", "https://openai.com/news/rss.xml"),
@@ -57,6 +67,27 @@ SOURCE_FEEDS = (
     ("RAGFlow", "https://github.com/infiniflow/ragflow/releases.atom"),
     ("InternLM", "https://github.com/InternLM/InternLM/releases.atom"),
     ("ModelScope", "https://github.com/modelscope/modelscope/releases.atom"),
+)
+SOURCE_DOCUMENTS = (
+    ("Dive into Deep Learning 教材", "https://d2l.ai/d2l-en.pdf", "教材 PDF"),
+    ("Stanford CS229 机器学习讲义", "https://cs229.stanford.edu/notes2021spring/notes2021spring/lecture1.pdf", "课程讲义 PDF"),
+    ("MIT 6.100L Python 课程讲义", "https://ocw.mit.edu/courses/6-100l-introduction-to-cs-and-programming-using-python-fall-2022/mit6_100l_f22_lec01.pdf", "课程讲义 PDF"),
+    ("MIT 6.100L Python 课程文字讲义", "https://ocw.mit.edu/courses/6-100l-introduction-to-cs-and-programming-using-python-fall-2022/resources/6100l-lecture-2-multi-version-4_1_transcript_pdf/", "课程讲义 PDF"),
+    ("Python 官方教程", "https://docs.python.org/3/tutorial/", "官方学习网站"),
+    ("Python PEP 8 官方规范", "https://peps.python.org/pep-0008/", "官方学习网站"),
+    ("scikit-learn 用户指南", "https://scikit-learn.org/stable/user_guide.html", "官方学习网站"),
+    ("PyTorch 官方教程", "https://pytorch.org/tutorials/", "官方学习网站"),
+    ("Real Python 教程", "https://realpython.com/tutorials/all/", "技术博客"),
+)
+UNDERGRADUATE_TOPICS = (
+    "Python 基础与工程习惯",
+    "数据结构与算法",
+    "概率统计与机器学习",
+    "线性代数与神经网络",
+    "深度学习训练与泛化",
+    "Transformer 与大语言模型",
+    "计算机系统与 AI 算力",
+    "软件工程与 AI 项目实践",
 )
 BLOCKED_TERMS = (
     "制作爆炸物",
@@ -347,6 +378,30 @@ async def _fetch_page_content(client: httpx.AsyncClient, url: str) -> str:
         return ""
 
 
+async def _fetch_document_material(
+    client: httpx.AsyncClient, source_name: str, url: str, source_type: str
+) -> list[str]:
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+        if url.lower().split("?", 1)[0].endswith(".pdf") or "application/pdf" in response.headers.get("content-type", ""):
+            reader = PdfReader(BytesIO(response.content))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages[:30])
+            text = re.sub(r"\n{2,}", "\n", _clean_feed_text(text)).strip()[:12000]
+        else:
+            text = _extract_article_text(response.text)
+        if len(text) < 800:
+            return []
+        title = source_name
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = _clean_feed_text(title_match.group(1))[:160] or title
+        return [f"资料类型：{source_type}\n来源机构：{source_name}\n标题：{title}\n原文正文：{text}\n来源：{url}"]
+    except Exception as exc:
+        logger.debug("学习资料不可用：{}（{}）", source_name, type(exc).__name__)
+        return []
+
+
 async def _fetch_feed_materials(client: httpx.AsyncClient, source_name: str, feed_url: str) -> list[str]:
     try:
         response = await client.get(feed_url)
@@ -371,7 +426,7 @@ async def _fetch_feed_materials(client: httpx.AsyncClient, source_name: str, fee
             if article:
                 summary = f"{summary}\n原文正文：{article}" if summary else article
             if summary:
-                materials.append(f"来源机构：{source_name}\n标题：{title}\n摘要：{summary}\n来源：{link}")
+                materials.append(f"资料类型：技术博客或项目公告\n来源机构：{source_name}\n标题：{title}\n摘要：{summary}\n来源：{link}")
         return materials
     except Exception as exc:
         logger.debug("资料源不可用：{}（{}）", source_name, type(exc).__name__)
@@ -388,9 +443,13 @@ async def _fetch_source_material() -> str:
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 4.0))
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        results = await asyncio.gather(
+        feed_results = asyncio.gather(
             *(_fetch_feed_materials(client, source_name, feed_url) for source_name, feed_url in SOURCE_FEEDS)
         )
+        document_results = asyncio.gather(
+            *(_fetch_document_material(client, source_name, url, source_type) for source_name, url, source_type in SOURCE_DOCUMENTS)
+        )
+        results = [*await feed_results, *await document_results]
 
     materials = [material for source_materials in results for material in source_materials]
     if not materials:
@@ -422,6 +481,7 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     evidence_list = "\n".join(
         f"{index}. {candidate}" for index, candidate in enumerate(evidence_candidates, start=1)
     )
+    topic = random.choice(UNDERGRADUATE_TOPICS)
     length_instruction = (
         "正文 600 至 900 个中文字符，可以分成 4 至 6 个短段落。"
         if detailed
@@ -441,14 +501,15 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     )
     source_input = f"{source_material}\n\n可核验的原文证据候选：\n{evidence_list}"
     draft_prompt = (
-        "你是一名严谨的 AI 技术编辑。请把下面这一篇文章凝练成让群友真正学到东西的中文摘要。"
+        "你是一名严谨的本科生课程编辑。请把下面这一篇教材、课程讲义、学习网站或技术文章凝练成让群友真正学到东西的中文摘要。"
+        f"本次学习方向是：{topic}。内容要解释清楚一个本科生能掌握的核心概念，并在原文允许时联系 Python 实践，但不能补入原文没有的代码、API、数字或结论。"
         f"{length_instruction}{format_instruction}{grounding_instruction}"
         f"\n\n原文资料：\n{source_input}"
     )
     try:
         draft = await _call_ark(draft_prompt, allow_links=False, max_output_tokens=1300 if detailed else 700)
         review_prompt = (
-            "你是一名事实审校员。请逐句对照原文审查草稿，删除或改写所有原文未直接支持的内容。"
+            "你是一名本科课程事实审校员。请逐句对照原文审查草稿，删除或改写所有原文未直接支持的内容。"
             "不要保留仅仅合理但原文没有说的机制、数字、因果关系、评价或建议。"
             f"{length_instruction}{format_instruction}{grounding_instruction}"
             f"\n\n原文资料：\n{source_input}\n\n待审校草稿：\n{draft}"
