@@ -75,6 +75,11 @@ SOURCE_DOCUMENTS = (
     ("MIT 6.100L Python 课程文字讲义", "https://ocw.mit.edu/courses/6-100l-introduction-to-cs-and-programming-using-python-fall-2022/resources/6100l-lecture-2-multi-version-4_1_transcript_pdf/", "课程讲义 PDF"),
     ("Python 官方教程", "https://docs.python.org/3/tutorial/", "官方学习网站"),
     ("Python PEP 8 官方规范", "https://peps.python.org/pep-0008/", "官方学习网站"),
+    ("Harvard CS50P Python 课程总览", "https://cs50.harvard.edu/python/courses/", "本科课程网站"),
+    ("Harvard CS50P Week 0 函数与变量", "https://cs50.harvard.edu/python/weeks/0/", "本科课程网站"),
+    ("Harvard CS50P Week 2 循环", "https://cs50.harvard.edu/python/weeks/2/", "本科课程网站"),
+    ("Harvard CS50P Week 6 文件 I/O", "https://cs50.harvard.edu/python/weeks/6/", "本科课程网站"),
+    ("Harvard CS50P Week 8 面向对象", "https://cs50.harvard.edu/python/weeks/8/", "本科课程网站"),
     ("scikit-learn 用户指南", "https://scikit-learn.org/stable/user_guide.html", "官方学习网站"),
     ("PyTorch 官方教程", "https://pytorch.org/tutorials/", "官方学习网站"),
     ("Real Python 教程", "https://realpython.com/tutorials/all/", "技术博客"),
@@ -140,6 +145,7 @@ conversation_history: dict[tuple[int, int], deque[tuple[str, str]]] = defaultdic
 quiz_sessions: dict[int, dict[str, str]] = {}
 last_request_at: dict[int, float] = {}
 source_cache: tuple[float, str] | None = None
+SOURCE_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", ".source_cache.json")
 
 
 def _group_ids() -> list[int]:
@@ -176,6 +182,7 @@ def _validate_text(text: str, allow_links: bool = False) -> None:
 
 
 def _format_for_qq(text: str) -> str:
+    text = html.unescape(text)
     text = text.replace("\\\\", "\\")
     text = re.sub(r"```(?:\w+)?\s*", "", text)
     text = text.replace("```", "")
@@ -271,11 +278,13 @@ def _validate_grounded_knowledge(text: str, source_material: str, evidence_candi
     ):
         raise ValueError("依据编号无效")
 
-    source_numbers = set(re.findall(r"\d+(?:\.\d+)?%?", source_material))
+    quantitative_pattern = r"\d+(?:\.\d+)%|\d+\.\d+|\d+(?:\.\d+)?\s*(?:倍|万|亿|GB|MB|KB|ms|秒|分钟|小时|参数|样本|分)"
+    source_numbers = set(re.findall(quantitative_pattern, source_material, re.IGNORECASE))
     summary_without_evidence_ids = re.sub(r"依据编号：[^\n]+", "", text)
+    summary_without_practice = re.split(r"(?:最小示例|练习题|答案提示)：", summary_without_evidence_ids, maxsplit=1)[0]
     unsupported_numbers = {
         number
-        for number in re.findall(r"\d+(?:\.\d+)?%?", summary_without_evidence_ids)
+        for number in re.findall(quantitative_pattern, summary_without_practice, re.IGNORECASE)
         if number not in source_numbers
     }
     if unsupported_numbers:
@@ -361,6 +370,12 @@ def _extract_article_text(page: str) -> str:
     return re.sub(r"\n{2,}", "\n", _clean_feed_text(content)).strip()[:6000]
 
 
+def _extract_pdf_text(content: bytes) -> str:
+    reader = PdfReader(BytesIO(content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages[:12])
+    return re.sub(r"\n{2,}", "\n", _clean_feed_text(text)).strip()[:12000]
+
+
 def _first_node(entry: ET.Element, names: tuple[str, ...]) -> ET.Element | None:
     for name in names:
         node = entry.find(name)
@@ -385,9 +400,7 @@ async def _fetch_document_material(
         response = await client.get(url)
         response.raise_for_status()
         if url.lower().split("?", 1)[0].endswith(".pdf") or "application/pdf" in response.headers.get("content-type", ""):
-            reader = PdfReader(BytesIO(response.content))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages[:30])
-            text = re.sub(r"\n{2,}", "\n", _clean_feed_text(text)).strip()[:12000]
+            text = await asyncio.to_thread(_extract_pdf_text, response.content)
         else:
             text = _extract_article_text(response.text)
         if len(text) < 800:
@@ -438,16 +451,29 @@ async def _fetch_source_material() -> str:
     cache_seconds = int(os.getenv("SOURCE_CACHE_SECONDS", "21600"))
     if source_cache and time.monotonic() - source_cache[0] < cache_seconds:
         return source_cache[1]
+    try:
+        cache_age = time.time() - os.path.getmtime(SOURCE_CACHE_FILE)
+        if cache_age < cache_seconds:
+            with open(SOURCE_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+                material = json.load(cache_file)["material"]
+            source_cache = (time.monotonic(), material)
+            return material
+    except (FileNotFoundError, KeyError, OSError, TypeError, json.JSONDecodeError):
+        pass
 
     timeout_seconds = float(os.getenv("SOURCE_TIMEOUT_SECONDS", "6"))
     started_at = time.perf_counter()
     timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 4.0))
+    document_limit = max(1, min(int(os.getenv("SOURCE_DOCUMENT_LIMIT", "2")), len(SOURCE_DOCUMENTS)))
+    feed_limit = max(1, min(int(os.getenv("SOURCE_FEED_LIMIT", "2")), len(SOURCE_FEEDS)))
+    selected_documents = random.sample(SOURCE_DOCUMENTS, document_limit)
+    selected_feeds = random.sample(SOURCE_FEEDS, feed_limit)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         feed_results = asyncio.gather(
-            *(_fetch_feed_materials(client, source_name, feed_url) for source_name, feed_url in SOURCE_FEEDS)
+            *(_fetch_feed_materials(client, source_name, feed_url) for source_name, feed_url in selected_feeds)
         )
         document_results = asyncio.gather(
-            *(_fetch_document_material(client, source_name, url, source_type) for source_name, url, source_type in SOURCE_DOCUMENTS)
+            *(_fetch_document_material(client, source_name, url, source_type) for source_name, url, source_type in selected_documents)
         )
         results = [*await feed_results, *await document_results]
 
@@ -457,13 +483,24 @@ async def _fetch_source_material() -> str:
     substantial_materials = [material for material in materials if len(material) >= 1200]
     if not substantial_materials:
         raise RuntimeError("已连接资料源，但未取得足够完整的文章正文")
-    material = random.choice(substantial_materials)
+    document_materials = [
+        material
+        for material in substantial_materials
+        if not material.startswith("资料类型：技术博客或项目公告")
+    ]
+    material = random.choice(document_materials or substantial_materials)
     source_cache = (time.monotonic(), material)
+    try:
+        os.makedirs(os.path.dirname(SOURCE_CACHE_FILE), exist_ok=True)
+        with open(SOURCE_CACHE_FILE, "w", encoding="utf-8") as cache_file:
+            json.dump({"material": material}, cache_file, ensure_ascii=False)
+    except OSError as exc:
+        logger.debug("无法写入资料缓存：{}", exc)
     logger.info(
         "资料抓取耗时：{:.2f}s，可用条目：{}，完整文章：{}",
         time.perf_counter() - started_at,
         len(materials),
-        len(substantial_materials),
+        len(document_materials),
     )
     return material
 
@@ -488,7 +525,7 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
         else "正文 320 至 520 个中文字符，完成整篇文章的高密度压缩，适合群聊学习，不要写成泛泛科普。"
     )
     format_instruction = (
-        "固定结构为：标题、文章结论、关键机制、重要细节、适用边界、依据编号。"
+        "固定结构为：标题、今天学什么、关键机制、最小示例、练习题、答案提示、适用边界、依据编号。"
         "最后一行必须是“依据编号：N,M”，N 和 M 是下方证据候选中的两个不同编号。"
         "不要输出网址、原文摘录、Markdown 表格或 Markdown 标题。"
     )
@@ -497,12 +534,14 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
         "原文没有的公式、数字、实验结果、模型版本、背景知识、评价和工程建议一律不要补写。"
         "只有原文明确给出时才可写公式、复杂度、数字或实验结果。"
         "如果原文没有明确限制，在适用边界写“原文未明确说明”，不要自行推测。"
-        "不要把常识、你的推断或其他文章的信息混入摘要。"
+        "不要把常识、你的推断或其他文章的信息混入事实部分。"
+        "“最小示例”只能使用 Python 标准库和原文明确出现的概念；代码必须短小、可运行，并标注为教学改写，不得声称来自原文。"
+        "“练习题”必须围绕今天的一个概念设计，难度控制在本科生 10 分钟内能完成；“答案提示”只给思路，不直接给完整答案。"
     )
     source_input = f"{source_material}\n\n可核验的原文证据候选：\n{evidence_list}"
     draft_prompt = (
-        "你是一名严谨的本科生课程编辑。请把下面这一篇教材、课程讲义、学习网站或技术文章凝练成让群友真正学到东西的中文摘要。"
-        f"本次学习方向是：{topic}。内容要解释清楚一个本科生能掌握的核心概念，并在原文允许时联系 Python 实践，但不能补入原文没有的代码、API、数字或结论。"
+        "你是一名严谨的本科生课程编辑。请把下面这一篇教材、课程讲义、学习网站或技术文章，改造成一节能学完、能动手的群聊微课。"
+        f"本次学习方向是：{topic}。只教一个核心概念，不要泛泛罗列文章目录；正文必须让读者知道今天学完后能写什么、判断什么或避免什么。"
         f"{length_instruction}{format_instruction}{grounding_instruction}"
         f"\n\n原文资料：\n{source_input}"
     )

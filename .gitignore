@@ -8,4 +8,5 @@ local/
 napcat/
 napcat-data/
 *.log
+data/.source_cache.json
 .DS_Store
