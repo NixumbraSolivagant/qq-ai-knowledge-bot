@@ -146,6 +146,8 @@ quiz_sessions: dict[int, dict[str, str]] = {}
 last_request_at: dict[int, float] = {}
 source_cache: tuple[float, str] | None = None
 SOURCE_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", ".source_cache.json")
+LOCAL_KB_INDEX = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "knowledge_base", "index.json")
+LOCAL_KB_STATE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "knowledge_base", "state.json")
 
 
 def _group_ids() -> list[int]:
@@ -451,6 +453,11 @@ async def _fetch_source_material() -> str:
     cache_seconds = int(os.getenv("SOURCE_CACHE_SECONDS", "21600"))
     if source_cache and time.monotonic() - source_cache[0] < cache_seconds:
         return source_cache[1]
+    if os.getenv("LOCAL_KB_ENABLED", "1").lower() not in {"0", "false", "no"}:
+        local_material = _next_local_kb_material()
+        if local_material:
+            source_cache = (time.monotonic(), local_material)
+            return local_material
     try:
         cache_age = time.time() - os.path.getmtime(SOURCE_CACHE_FILE)
         if cache_age < cache_seconds:
@@ -505,6 +512,45 @@ async def _fetch_source_material() -> str:
     return material
 
 
+def _next_local_kb_material() -> str:
+    try:
+        with open(LOCAL_KB_INDEX, "r", encoding="utf-8") as index_file:
+            chunks = json.load(index_file)["chunks"]
+        chunks = [chunk for chunk in chunks if len(chunk.get("text", "")) >= 800]
+        if not chunks:
+            return ""
+        cursor = 0
+        try:
+            with open(LOCAL_KB_STATE, "r", encoding="utf-8") as state_file:
+                cursor = int(json.load(state_file).get("cursor", 0))
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        chunk = chunks[cursor % len(chunks)]
+        with open(LOCAL_KB_STATE, "w", encoding="utf-8") as state_file:
+            json.dump({"cursor": cursor + 1}, state_file)
+        return (
+            "资料类型：本地教材章节\n"
+            f"来源机构：{chunk['book_title']}\n"
+            f"标题：{chunk['book_title']}（第 {chunk['page_start']}-{chunk['page_end']} 页）\n"
+            f"原文正文：{chunk['text']}\n"
+            f"来源：{chunk['source_url']}"
+        )
+    except (FileNotFoundError, KeyError, TypeError, OSError, json.JSONDecodeError) as exc:
+        logger.debug("本地知识库不可用：{}", exc)
+        return ""
+
+
+def _topic_for_material(source_material: str) -> str:
+    material = source_material.lower()
+    if any(keyword in material for keyword in ("think python", "python", "pep 8", "cs50p", "6.100l")):
+        return "Python 编程基础与工程习惯"
+    if any(keyword in material for keyword in ("dive into deep learning", "深度学习", "neural network")):
+        return "深度学习基础与实践"
+    if any(keyword in material for keyword in ("cs229", "machine learning", "机器学习")):
+        return "机器学习基础与数学直觉"
+    return "本科生计算机与人工智能基础"
+
+
 async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     try:
         source_material = await _fetch_source_material()
@@ -518,7 +564,7 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     evidence_list = "\n".join(
         f"{index}. {candidate}" for index, candidate in enumerate(evidence_candidates, start=1)
     )
-    topic = random.choice(UNDERGRADUATE_TOPICS)
+    topic = _topic_for_material(source_material)
     length_instruction = (
         "正文 600 至 900 个中文字符，可以分成 4 至 6 个短段落。"
         if detailed
@@ -554,7 +600,17 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
             f"\n\n原文资料：\n{source_input}\n\n待审校草稿：\n{draft}"
         )
         reviewed = await _call_ark(review_prompt, allow_links=False, max_output_tokens=1300 if detailed else 700)
-        content = _render_grounded_knowledge(reviewed, source_material, evidence_candidates, detailed)
+        try:
+            content = _render_grounded_knowledge(reviewed, source_material, evidence_candidates, detailed)
+        except ValueError as review_error:
+            repair_prompt = (
+                "只修复下面审校稿的格式和事实边界，不新增任何知识。必须保留原文支持的内容，"
+                "并严格在最后一行输出“依据编号：N,M”；N、M 必须是原文证据候选中的两个不同编号。"
+                f"{format_instruction}{grounding_instruction}"
+                f"\n\n原文资料：\n{source_input}\n\n审校稿：\n{reviewed}\n\n格式错误：{review_error}"
+            )
+            repaired = await _call_ark(repair_prompt, allow_links=False, max_output_tokens=1300 if detailed else 700)
+            content = _render_grounded_knowledge(repaired, source_material, evidence_candidates, detailed)
         title = "📖 AI 文章精读" if detailed else "📚 今日 AI 文章凝练"
         return Message(f"{title}\n\n{content}")
     except Exception as exc:

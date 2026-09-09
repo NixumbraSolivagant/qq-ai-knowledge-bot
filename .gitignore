@@ -9,4 +9,5 @@ napcat/
 napcat-data/
 *.log
 data/.source_cache.json
+data/knowledge_base/
 .DS_Store
