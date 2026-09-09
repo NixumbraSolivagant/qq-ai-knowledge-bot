@@ -295,15 +295,19 @@ def _validate_grounded_knowledge(text: str, source_material: str, evidence_candi
 
 
 def _render_grounded_knowledge(text: str, source_material: str, evidence_candidates: list[str], detailed: bool) -> str:
-    first_index, second_index = _validate_grounded_knowledge(text, source_material, evidence_candidates)
+    _validate_grounded_knowledge(text, source_material, evidence_candidates)
     body = re.sub(r"\n?依据编号：[^\n]+", "", text).strip()
-    body = _truncate_at_sentence(body, 1000 if detailed else 520)
-    return (
-        f"{body}\n\n"
-        f"依据摘录一：{evidence_candidates[first_index]}\n"
-        f"依据摘录二：{evidence_candidates[second_index]}\n"
-        f"资料来源：{_source_url(source_material)}"
+    body = re.sub(r"(?m)^答案提示：.*$", "", body)
+    body = re.sub(r"(?m)^适用边界：.*$", "", body)
+    body = re.sub(r"(?m)^依据摘录[一二]：.*$", "", body)
+    body = re.sub(
+        r"(?m)^(标题|今天学什么|核心讲解|最小示例|常见误区|练习题)\s*[：:]?\s*$",
+        r"\1：",
+        body,
     )
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    body = _truncate_at_sentence(body, 1400 if detailed else 800)
+    return f"{body}\n\n资料来源：{_source_url(source_material)}"
 
 
 def _wants_detailed(question: str) -> bool:
@@ -566,23 +570,24 @@ async def _build_advanced_knowledge(detailed: bool = False) -> Message:
     )
     topic = _topic_for_material(source_material)
     length_instruction = (
-        "正文 600 至 900 个中文字符，可以分成 4 至 6 个短段落。"
+        "正文 800 至 1200 个中文字符，可以分成 5 至 7 个短段落，重点讲透概念、执行过程和例子。"
         if detailed
-        else "正文 320 至 520 个中文字符，完成整篇文章的高密度压缩，适合群聊学习，不要写成泛泛科普。"
+        else "正文 550 至 800 个中文字符，把更多篇幅用于核心讲解和具体例子，适合群聊学习，不要写成泛泛科普。"
     )
     format_instruction = (
-        "固定结构为：标题、今天学什么、关键机制、最小示例、练习题、答案提示、适用边界、依据编号。"
+        "固定结构为：标题、今天学什么、核心讲解、最小示例、常见误区、练习题、依据编号。"
         "最后一行必须是“依据编号：N,M”，N 和 M 是下方证据候选中的两个不同编号。"
-        "不要输出网址、原文摘录、Markdown 表格或 Markdown 标题。"
+        "不要输出网址、答案提示、适用边界、原文摘录、Markdown 表格或 Markdown 标题。"
     )
     grounding_instruction = (
         "只压缩这一篇原文。每一个事实、数字、比较、因果关系和结论都必须由原文直接支持。"
         "原文没有的公式、数字、实验结果、模型版本、背景知识、评价和工程建议一律不要补写。"
         "只有原文明确给出时才可写公式、复杂度、数字或实验结果。"
-        "如果原文没有明确限制，在适用边界写“原文未明确说明”，不要自行推测。"
         "不要把常识、你的推断或其他文章的信息混入事实部分。"
         "“最小示例”只能使用 Python 标准库和原文明确出现的概念；代码必须短小、可运行，并标注为教学改写，不得声称来自原文。"
-        "“练习题”必须围绕今天的一个概念设计，难度控制在本科生 10 分钟内能完成；“答案提示”只给思路，不直接给完整答案。"
+        "“核心讲解”至少说明概念是什么、程序执行时发生什么、为什么这样设计，并给出一个具体输入输出过程。"
+        "“常见误区”只写与本节概念直接相关、能从原文支持的错误理解。"
+        "“练习题”必须围绕今天的一个概念设计，难度控制在本科生 10 分钟内能完成，不要提供答案或提示。"
     )
     source_input = f"{source_material}\n\n可核验的原文证据候选：\n{evidence_list}"
     draft_prompt = (
